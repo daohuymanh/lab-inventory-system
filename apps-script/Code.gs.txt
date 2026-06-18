@@ -1,0 +1,302 @@
+const DATA_SHEET_NAME = 'ARBO';
+const LOG_SHEET_NAME = 'NHATKY';
+
+const TZ = 'Asia/Ho_Chi_Minh';
+
+// ARBO
+const CODE_COL = 4;       // D: MÃ HÀNG
+const NAME_COL = 5;       // E: TÊN HÀNG
+const TOTAL_QTY_COL = 13;  // M: SỐ LƯỢNG NHẬP
+const USE_DATE_COL = 14;   // N: Ngày sử dụng gần nhất
+const USE_QTY_COL = 15;    // O: Số lượng sử dụng
+const STOCK_COL = 16;      // P: Tồn = M - O
+
+// NHATKY
+const LOG_TIME_COL = 1;    // A: Thời gian
+const LOG_USER_COL = 2;    // B: Người cập nhật
+const LOG_CODE_COL = 3;    // C: Mã hàng
+const LOG_NAME_COL = 4;    // D: Tên hàng
+const LOG_QTY_COL = 5;     // E: Số lượng sử dụng
+const LOG_NOTE_COL = 6;    // F: Ghi chú
+
+function onOpen() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  try {
+    ss.setSpreadsheetTimeZone(TZ);
+  } catch (err) {
+    // Nếu không set được thì vẫn chạy tiếp
+  }
+
+  SpreadsheetApp.getUi()
+    .createMenu('Sinh phẩm')
+    .addItem('Làm mới công thức tổng hợp', 'refreshSummaryFormulas')
+    .addItem('Tạo/kiểm tra sheet nhật ký', 'ensureLogSheetUi')
+    .addItem('Cài trigger cập nhật tự động', 'installTriggers')
+    .addToUi();
+
+  ensureLogSheet_(ss);
+  refreshSummaryFormulas();
+}
+
+function doGet(e) {
+  const t = HtmlService.createTemplateFromFile('Index');
+  t.code = e && e.parameter && e.parameter.code ? String(e.parameter.code).trim() : '';
+  t.user = getDefaultUpdater_();
+  return t.evaluate()
+    .setTitle('Quản lý sinh phẩm')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function getItemInfo(code) {
+  code = String(code || '').trim();
+  if (!code) throw new Error('Thiếu mã hàng.');
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const dataSheet = getDataSheet_(ss);
+
+  const row = findRowByCode_(dataSheet, code);
+  if (!row) throw new Error(`Không tìm thấy mã: ${code}`);
+
+  const name = String(dataSheet.getRange(row, NAME_COL).getValue() || '').trim();
+  const totalQty = Number(dataSheet.getRange(row, TOTAL_QTY_COL).getValue()) || 0;
+  const usedQty = Number(dataSheet.getRange(row, USE_QTY_COL).getValue()) || 0;
+  const remaining = Number(dataSheet.getRange(row, STOCK_COL).getValue()) || Math.max(totalQty - usedQty, 0);
+
+  return {
+    ok: true,
+    code,
+    name,
+    totalQty,
+    usedQty,
+    remaining,
+    exhausted: totalQty > 0 ? usedQty >= totalQty : false,
+    lowStock: totalQty > 0 ? (remaining > 0 && remaining <= 5) : false
+  };
+}
+
+function saveUsage(payload) {
+  const code = String(payload.code || '').trim();
+  const qty = Number(payload.qty);
+  let updater = String(payload.updater || '').trim();
+
+  if (!code) throw new Error('Thiếu mã hàng.');
+  if (!Number.isFinite(qty) || qty <= 0) throw new Error('Số lượng không hợp lệ.');
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const dataSheet = getDataSheet_(ss);
+  ensureLogSheet_(ss);
+
+  const row = findRowByCode_(dataSheet, code);
+  if (!row) throw new Error(`Không tìm thấy mã: ${code}`);
+
+  const name = String(dataSheet.getRange(row, NAME_COL).getValue() || '').trim();
+  const totalQty = Number(dataSheet.getRange(row, TOTAL_QTY_COL).getValue()) || 0;
+  const currentUsed = Number(dataSheet.getRange(row, USE_QTY_COL).getValue()) || 0;
+
+  if (!updater) updater = getDefaultUpdater_() || 'Không rõ';
+
+  const afterUse = currentUsed + qty;
+  if (totalQty > 0 && afterUse > totalQty) {
+    throw new Error('Mã hàng này đã hết. Không thể sử dụng thêm.');
+  }
+
+  const remaining = totalQty > 0 ? Math.max(totalQty - afterUse, 0) : null;
+
+  let note = '';
+  if (remaining === 0 && totalQty > 0) {
+    note = 'Mã hàng này đã hết';
+  } else if (remaining !== null && remaining > 0 && remaining <= 5) {
+    note = 'Sinh phẩm sắp hết';
+  }
+
+  appendHistory_(ss, {
+    updater,
+    code,
+    name,
+    qty,
+    note
+  });
+
+  ensureSummaryFormulasForRow_(dataSheet, row);
+  SpreadsheetApp.flush();
+
+  return {
+    ok: true,
+    code,
+    name,
+    updater,
+    qty,
+    totalQty,
+    previousUsed: currentUsed,
+    usedQty: afterUse,
+    remaining,
+    note
+  };
+}
+
+function appendHistory_(ss, info) {
+  const log = ensureLogSheet_(ss);
+  const now = Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd HH:mm:ss');
+
+  log.appendRow([
+    now,
+    info.updater,
+    info.code,
+    info.name,
+    info.qty,
+    info.note || ''
+  ]);
+
+  // Cột A là text theo giờ VN
+}
+
+function refreshSummaryFormulas() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = getDataSheet_(ss);
+  const lastRow = sh.getLastRow();
+
+  if (lastRow < 2) return;
+
+  for (let row = 2; row <= lastRow; row++) {
+    ensureSummaryFormulasForRow_(sh, row);
+  }
+
+  SpreadsheetApp.flush();
+}
+
+function ensureSummaryFormulasForRow_(sh, row) {
+  const code = String(sh.getRange(row, CODE_COL).getValue() || '').trim();
+
+  if (!code) {
+    sh.getRange(row, USE_DATE_COL, 1, 3).clearContent(); // N:P
+    return;
+  }
+
+  const useDateFormula =
+    `=IF($D${row}="","",IFERROR(MAXIFS(${LOG_SHEET_NAME}!$A:$A,${LOG_SHEET_NAME}!$C:$C,$D${row}),""))`;
+
+  const useQtyFormula =
+    `=IF($D${row}="","",SUMIFS(${LOG_SHEET_NAME}!$E:$E,${LOG_SHEET_NAME}!$C:$C,$D${row}))`;
+
+  const stockFormula =
+    `=IF($D${row}="","",MAX($M${row}-$O${row},0))`;
+
+  sh.getRange(row, USE_DATE_COL).setFormula(useDateFormula);
+  sh.getRange(row, USE_QTY_COL).setFormula(useQtyFormula);
+  sh.getRange(row, STOCK_COL).setFormula(stockFormula);
+
+  sh.getRange(row, USE_DATE_COL).setNumberFormat('yyyy-MM-dd HH:mm:ss');
+  sh.getRange(row, USE_QTY_COL).setNumberFormat('0');
+  sh.getRange(row, STOCK_COL).setNumberFormat('0');
+}
+
+function onEdit(e) {
+  try {
+    if (!e || !e.range) return;
+
+    const sh = e.range.getSheet();
+    if (sh.getName() !== DATA_SHEET_NAME) return;
+
+    const firstCol = e.range.getColumn();
+    const lastCol = e.range.getLastColumn();
+
+    if (firstCol > CODE_COL || lastCol < CODE_COL) return;
+
+    const startRow = e.range.getRow();
+    const numRows = e.range.getNumRows();
+
+    for (let i = 0; i < numRows; i++) {
+      const row = startRow + i;
+      if (row < 2) continue;
+      ensureSummaryFormulasForRow_(sh, row);
+    }
+  } catch (err) {
+    // im lặng
+  }
+}
+
+function onChange(e) {
+  try {
+    if (!e || !e.changeType) return;
+
+    const relevant = ['EDIT', 'INSERT_ROW', 'REMOVE_ROW', 'OTHER'];
+    if (relevant.indexOf(e.changeType) === -1) return;
+
+    refreshSummaryFormulas();
+  } catch (err) {
+    // im lặng
+  }
+}
+
+function installTriggers() {
+  const ss = SpreadsheetApp.getActive();
+
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(t => {
+    if (t.getHandlerFunction() === 'onChange') {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+
+  ScriptApp.newTrigger('onChange')
+    .forSpreadsheet(ss)
+    .onChange()
+    .create();
+
+  SpreadsheetApp.getUi().alert('Đã cài trigger onChange để tự cập nhật khi sửa/xóa NHATKY.');
+}
+
+function ensureLogSheetUi() {
+  ensureLogSheet_();
+  SpreadsheetApp.getUi().alert('Đã kiểm tra/tạo sheet NHATKY nếu chưa có.');
+}
+
+function ensureLogSheet_(ss) {
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
+  let log = ss.getSheetByName(LOG_SHEET_NAME);
+
+  if (!log) {
+    log = ss.insertSheet(LOG_SHEET_NAME);
+    log.getRange(1, 1, 1, 6).setValues([[
+      'Thời gian',
+      'Người cập nhật',
+      'Mã hàng',
+      'Tên hàng',
+      'Số lượng sử dụng',
+      'Ghi chú'
+    ]]);
+    log.getRange(1, 1, 1, 6).setFontWeight('bold');
+  }
+
+  return log;
+}
+
+function findRowByCode_(sh, code) {
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return null;
+
+  const range = sh.getRange(2, CODE_COL, lastRow - 1, 1);
+  const cell = range
+    .createTextFinder(String(code).trim())
+    .matchEntireCell(true)
+    .findNext();
+
+  return cell ? cell.getRow() : null;
+}
+
+function getDataSheet_(ss) {
+  const byName = ss.getSheetByName(DATA_SHEET_NAME);
+  if (byName) return byName;
+
+  const first = ss.getSheets()[0];
+  if (!first) throw new Error('Không có sheet nào trong file.');
+  return first;
+}
+
+function getDefaultUpdater_() {
+  try {
+    return Session.getActiveUser().getEmail() || '';
+  } catch (err) {
+    return '';
+  }
+}
